@@ -19,6 +19,14 @@ COLUMNS = [
 ]
 
 
+def inject_failure(fail_after, stage):
+    """Simulate a failure after a completed pipeline stage."""
+    if fail_after == stage:
+        raise RuntimeError(
+            f"Simulated CDC failure after {stage}"
+        )
+
+
 def prepare_events(df):
     """Validate and normalize incoming CDC events."""
 
@@ -31,26 +39,11 @@ def prepare_events(df):
 
     df = (
         df.select(*COLUMNS)
-        .withColumn(
-            "order_id",
-            F.col("order_id").cast("long")
-        )
-        .withColumn(
-            "quantity",
-            F.col("quantity").cast("int")
-        )
-        .withColumn(
-            "unit_price",
-            F.col("unit_price").cast("double")
-        )
-        .withColumn(
-            "sequence_num",
-            F.col("sequence_num").cast("long")
-        )
-        .withColumn(
-            "updated_at",
-            F.to_timestamp("updated_at")
-        )
+        .withColumn("order_id", F.col("order_id").cast("long"))
+        .withColumn("quantity", F.col("quantity").cast("int"))
+        .withColumn("unit_price", F.col("unit_price").cast("double"))
+        .withColumn("sequence_num", F.col("sequence_num").cast("long"))
+        .withColumn("updated_at", F.to_timestamp("updated_at"))
     )
 
     invalid = (
@@ -58,6 +51,7 @@ def prepare_events(df):
         | F.col("order_id").isNull()
         | F.col("sequence_num").isNull()
         | F.col("updated_at").isNull()
+        | F.col("operation").isNull()
         | ~F.col("operation").isin("I", "U", "D")
         | (
             (F.col("operation") != "D")
@@ -74,10 +68,8 @@ def prepare_events(df):
     if df.filter(invalid).limit(1).count():
         raise ValueError("Invalid CDC event")
 
-    # Remove identical duplicate records.
     df = df.dropDuplicates()
 
-    # Reject conflicting event IDs in the same batch.
     event_conflicts = (
         df.groupBy("event_id")
         .count()
@@ -89,7 +81,6 @@ def prepare_events(df):
             "Conflicting event_id values"
         )
 
-    # Reject conflicting sequence numbers.
     sequence_conflicts = (
         df.groupBy("order_id", "sequence_num")
         .count()
@@ -109,9 +100,7 @@ def latest_events(events):
 
     window = (
         Window.partitionBy("order_id")
-        .orderBy(
-            F.col("sequence_num").desc()
-        )
+        .orderBy(F.col("sequence_num").desc())
     )
 
     return (
@@ -124,19 +113,10 @@ def latest_events(events):
     )
 
 
-def validate_event_history(
-    spark,
-    incoming,
-    bronze_path
-):
-    """
-    Reject conflicting event IDs and order sequences
-    across previously processed CDC batches.
-    """
+def validate_event_history(spark, incoming, bronze_path):
+    """Reject conflicting CDC events across batches."""
 
-    if not DeltaTable.isDeltaTable(
-        spark, bronze_path
-    ):
+    if not DeltaTable.isDeltaTable(spark, bronze_path):
         return
 
     existing = (
@@ -145,18 +125,15 @@ def validate_event_history(
         .select(*COLUMNS)
     )
 
-    # Compare incoming event IDs with stored events.
     joined_events = (
         incoming.alias("s")
         .join(
             existing.alias("t"),
-            F.col("s.event_id")
-            == F.col("t.event_id"),
+            F.col("s.event_id") == F.col("t.event_id"),
             "inner"
         )
     )
 
-    # Detect same event ID with different content.
     differences = [
         ~F.col(f"s.{column}").eqNullSafe(
             F.col(f"t.{column}")
@@ -172,26 +149,19 @@ def validate_event_history(
             conflict_condition | difference
         )
 
-    event_conflicts = joined_events.filter(
+    if joined_events.filter(
         conflict_condition
-    )
-
-    if event_conflicts.limit(1).count():
+    ).limit(1).count():
         raise ValueError(
             "Conflicting CDC event_id across batches"
         )
 
-    # Detect different events with the same
-    # order ID and sequence number.
     sequence_conflicts = (
         incoming.alias("s")
         .join(
             existing.alias("t"),
             (
-                (
-                    F.col("s.order_id")
-                    == F.col("t.order_id")
-                )
+                (F.col("s.order_id") == F.col("t.order_id"))
                 & (
                     F.col("s.sequence_num")
                     == F.col("t.sequence_num")
@@ -200,8 +170,7 @@ def validate_event_history(
             "inner"
         )
         .filter(
-            F.col("s.event_id")
-            != F.col("t.event_id")
+            F.col("s.event_id") != F.col("t.event_id")
         )
     )
 
@@ -211,47 +180,43 @@ def validate_event_history(
         )
 
 
-def apply_cdc(spark, incoming, base_path):
+def apply_cdc(
+    spark,
+    incoming,
+    base_path,
+    fail_after=None
+):
     """
     Apply CDC events to Bronze, Silver and Gold.
 
-    Supports:
-    - Inserts
-    - Updates
-    - Soft deletes
-    - Duplicate event replay
-    - Out-of-order events
-    - Cross-batch conflict validation
+    Supports inserts, updates, soft deletes, replay,
+    out-of-order events, conflict validation, and
+    controlled failure injection.
     """
+
+    if fail_after not in (None, "bronze", "silver", "gold"):
+        raise ValueError(
+            "fail_after must be bronze, silver, gold, or None"
+        )
 
     base = Path(base_path)
 
-    bronze_path = str(
-        base / "bronze/events"
-    )
+    bronze_path = str(base / "bronze/events")
+    silver_path = str(base / "silver/orders")
+    gold_path = str(base / "gold/product_revenue")
 
-    silver_path = str(
-        base / "silver/orders"
-    )
-
-    gold_path = str(
-        base / "gold/product_revenue"
-    )
-
-    # Step 1: Validate incoming CDC events.
+    # Step 1: Validate incoming events.
     incoming = prepare_events(incoming)
 
-    # Step 2: Validate against existing Bronze history.
+    # Step 2: Validate against Bronze history.
     validate_event_history(
         spark,
         incoming,
         bronze_path
     )
 
-    # Step 3: Store unique CDC events in Bronze.
-    if DeltaTable.isDeltaTable(
-        spark, bronze_path
-    ):
+    # Step 3: Write unique events to Bronze.
+    if DeltaTable.isDeltaTable(spark, bronze_path):
         bronze = DeltaTable.forPath(
             spark, bronze_path
         )
@@ -265,7 +230,6 @@ def apply_cdc(spark, incoming, base_path):
             .whenNotMatchedInsertAll()
             .execute()
         )
-
     else:
         (
             incoming.write
@@ -274,18 +238,17 @@ def apply_cdc(spark, incoming, base_path):
             .save(bronze_path)
         )
 
-    # Step 4: Read complete Bronze event history.
+    # Simulate failure after Bronze commit.
+    inject_failure(fail_after, "bronze")
+
+    # Step 4: Read Bronze history.
     history = (
         spark.read.format("delta")
         .load(bronze_path)
     )
 
-    # Check sequence conflicts in stored history.
     history_conflicts = (
-        history.groupBy(
-            "order_id",
-            "sequence_num"
-        )
+        history.groupBy("order_id", "sequence_num")
         .count()
         .filter(F.col("count") > 1)
     )
@@ -295,10 +258,10 @@ def apply_cdc(spark, incoming, base_path):
             "Conflicting CDC event history"
         )
 
-    # Step 5: Identify the latest event per order.
+    # Step 5: Select latest event per order.
     latest = latest_events(history)
 
-    # Step 6: Build Silver order state.
+    # Step 6: Build Silver order states.
     silver = (
         latest.select(
             "order_id",
@@ -318,16 +281,13 @@ def apply_cdc(spark, incoming, base_path):
             "revenue",
             F.when(
                 F.col("operation") != "D",
-                F.col("quantity")
-                * F.col("unit_price")
+                F.col("quantity") * F.col("unit_price")
             ).otherwise(F.lit(0.0))
         )
     )
 
-    # Step 7: MERGE latest order state into Silver.
-    if DeltaTable.isDeltaTable(
-        spark, silver_path
-    ):
+    # Step 7: MERGE Silver order states.
+    if DeltaTable.isDeltaTable(spark, silver_path):
         target = DeltaTable.forPath(
             spark, silver_path
         )
@@ -339,14 +299,11 @@ def apply_cdc(spark, incoming, base_path):
                 "t.order_id = s.order_id"
             )
             .whenMatchedUpdateAll(
-                condition=(
-                    "s.sequence_num > t.sequence_num"
-                )
+                condition="s.sequence_num > t.sequence_num"
             )
             .whenNotMatchedInsertAll()
             .execute()
         )
-
     else:
         (
             silver.write
@@ -355,31 +312,33 @@ def apply_cdc(spark, incoming, base_path):
             .save(silver_path)
         )
 
+    # Simulate failure after Silver commit.
+    inject_failure(fail_after, "silver")
+
     # Step 8: Read current Silver state.
     current = (
         spark.read.format("delta")
         .load(silver_path)
     )
 
-    # Step 9: Exclude soft-deleted orders from Gold.
+    # Step 9: Build Gold revenue aggregates.
     gold = (
-        current.filter(
-            ~F.col("is_deleted")
-        )
+        current.filter(~F.col("is_deleted"))
         .groupBy("product")
         .agg(
-            F.sum("revenue").alias(
-                "total_revenue"
-            )
+            F.sum("revenue").alias("total_revenue")
         )
     )
 
-    # Step 10: Refresh Gold aggregates.
+    # Step 10: Refresh Gold.
     (
         gold.write
         .format("delta")
         .mode("overwrite")
         .save(gold_path)
     )
+
+    # Simulate failure after Gold commit.
+    inject_failure(fail_after, "gold")
 
     return current, gold
