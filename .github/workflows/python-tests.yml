@@ -33,9 +33,12 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
+      
       - name: Run Automated PySpark Tests
         env:
           SPARK_LOCAL_IP: 127.0.0.1
           PYTHONPATH: ${{ github.workspace }}
+          PYSPARK_SUBMIT_ARGS: "--packages io.delta:delta-spark_2.12:3.2.0 pyspark-shell"
         run: |
           python -m pytest tests/ -v
+
