@@ -1,0 +1,9 @@
+
+event_id,order_id,customer_id,product,quantity,unit_price,operation,sequence_num,updated_at
+E001,1001,C101,Laptop,1,850.0,I,1,2026-11-17 09:00:00
+E002,1002,C102,Keyboard,2,45.0,I,2,2026-11-17 09:05:00
+E003,1003,C103,Mouse,3,20.0,I,3,2026-11-17 09:10:00
+E004,1001,C101,Laptop,2,850.0,U,4,2026-11-17 10:00:00
+E005,1002,C102,Keyboard,2,45.0,D,5,2026-11-17 10:30:00
+E006,1004,C104,Monitor,1,300.0,I,6,2026-11-17 11:00:00
+E007,1003,C103,Mouse,5,20.0,U,7,2026-11-17 11:30:00
